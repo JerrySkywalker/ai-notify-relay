@@ -16,3 +16,7 @@ Build with `cargo build --locked --release`. Start the binary with these environ
 Run behind an HTTPS reverse proxy for devices outside this machine. Keep the database on local persistent storage. The database contains the final replies whenever a collector has text forwarding enabled. A token change takes effect after restarting the relay with the updated configuration.
 
 See [protocol v1](docs/protocol.md). Run `./scripts/local-ci.ps1` to check the Rust project on Windows.
+
+## Phone inbox actions
+
+Set the optional AINOTIFY_INBOX_TOKEN to a distinct random token. Enter it on each phone that can update pinned, archived or trashed state. Existing reader credentials remain read-only. The database adds inbox tables at startup and keeps stored events. See [protocol v1](docs/protocol.md).

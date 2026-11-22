@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+use crate::mailbox::{self, Action, Applied, MailState};
 use crate::store::{Event, EventSummary, Insert, Store};
 
 #[derive(Clone)]
@@ -41,16 +42,24 @@ impl State {
 
 pub struct Auth {
     reader: [u8; 32],
+    inbox: Option<[u8; 32]>,
     writers: HashMap<String, [u8; 32]>,
 }
 
 impl Auth {
-    pub fn new(reader: &str, writers: HashMap<String, String>) -> Result<Self, &'static str> {
+    pub fn new(
+        reader: &str,
+        writers: HashMap<String, String>,
+        inbox: Option<&str>,
+    ) -> Result<Self, &'static str> {
         if !valid_token(reader) || writers.is_empty() {
             return Err("configure a reader token and at least one writer");
         }
         let reader = hash(reader);
         let mut used = HashSet::from([reader]);
+        if inbox.is_some_and(|token| !valid_token(token) || !used.insert(hash(token))) {
+            return Err("configure a valid inbox token distinct from all other tokens");
+        }
         let mut devices = HashMap::new();
         for (device, token) in writers {
             if device.is_empty()
@@ -70,18 +79,25 @@ impl Auth {
         }
         Ok(Self {
             reader,
+            inbox: inbox.map(hash),
             writers: devices,
         })
     }
 
-    fn reader(&self, headers: &HeaderMap) -> Result<(), ApiError> {
-        if bool::from(self.reader.ct_eq(&bearer(headers)?)) {
-            Ok(())
+    fn reader(&self, headers: &HeaderMap) -> Result<bool, ApiError> {
+        let presented = bearer(headers)?;
+        if self
+            .inbox
+            .as_ref()
+            .is_some_and(|token| bool::from(token.ct_eq(&presented)))
+        {
+            Ok(true)
+        } else if bool::from(self.reader.ct_eq(&presented)) {
+            Ok(false)
         } else {
             Err(ApiError::unauthorized())
         }
     }
-
     fn writer(&self, headers: &HeaderMap) -> Result<&str, ApiError> {
         let presented = bearer(headers)?;
         self.writers
@@ -115,6 +131,8 @@ pub fn router(state: State) -> Router {
         .route("/v1/writer/status", get(writer_status))
         .route("/v1/events", post(create_event).get(events))
         .route("/v1/events/{id}", get(event_detail))
+        .route("/v1/inbox/changes", get(inbox_changes))
+        .route("/v1/inbox/actions", post(inbox_action))
         .layer(DefaultBodyLimit::max(820 * 1024))
         .with_state(state)
 }
@@ -206,6 +224,57 @@ async fn event_detail(
         turn_id: entry.event.turn_id,
         message: entry.event.message,
     }))
+}
+
+#[derive(Serialize)]
+struct Changes {
+    changes: Vec<MailState>,
+    next_cursor: i64,
+    can_write: bool,
+}
+
+async fn inbox_changes(
+    AxumState(state): AxumState<State>,
+    headers: HeaderMap,
+    Query(page): Query<Page>,
+) -> Result<Json<Changes>, ApiError> {
+    let can_write = state.0.auth.reader(&headers)?;
+    let limit = page.limit.unwrap_or(50);
+    if page.after < 0 || !(1..=100).contains(&limit) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid cursor or limit"));
+    }
+    let changes =
+        mailbox::changes(&state.store()?.0, page.after, limit).map_err(ApiError::database)?;
+    let next_cursor = changes.last().map_or(page.after, |entry| entry.seq);
+    Ok(Json(Changes {
+        changes,
+        next_cursor,
+        can_write,
+    }))
+}
+
+async fn inbox_action(
+    AxumState(state): AxumState<State>,
+    headers: HeaderMap,
+    Json(action): Json<Action>,
+) -> Result<Json<MailState>, ApiError> {
+    if !state.0.auth.reader(&headers)? {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "inbox write access required",
+        ));
+    }
+    if !action.valid() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid inbox action",
+        ));
+    }
+    match mailbox::apply(&mut state.store()?.0, &action).map_err(ApiError::database)? {
+        Applied::State(state) => Ok(Json(state)),
+        Applied::Missing => Err(ApiError(StatusCode::NOT_FOUND, "event not found")),
+        Applied::Conflict => Err(ApiError(StatusCode::CONFLICT, "action ID already in use")),
+    }
 }
 
 struct ApiError(StatusCode, &'static str);

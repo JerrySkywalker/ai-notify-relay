@@ -1,4 +1,5 @@
 mod api;
+mod mailbox;
 mod store;
 
 use std::{collections::HashMap, env, net::SocketAddr};
@@ -18,7 +19,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &env::var("AINOTIFY_WRITERS").map_err(|_| "AINOTIFY_WRITERS is required")?,
     )
     .map_err(|_| "AINOTIFY_WRITERS must be a JSON object of device IDs and tokens")?;
-    let state = State::new(Store::open(database)?, Auth::new(&reader, writers)?);
+    let inbox_token = env::var("AINOTIFY_INBOX_TOKEN");
+    let inbox_token = match inbox_token {
+        Ok(token) => Some(token),
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let state = State::new(
+        Store::open(database)?,
+        Auth::new(&reader, writers, inbox_token.as_deref())?,
+    );
     let listener = tokio::net::TcpListener::bind(listen).await?;
     println!("AINotify relay listening on {}", listener.local_addr()?);
     axum::serve(listener, api::router(state)).await?;

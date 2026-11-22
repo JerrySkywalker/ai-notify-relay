@@ -8,10 +8,26 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Clone, Deserialize, Serialize)]
+pub struct Frontend {
+    pub id: String,
+    pub label: String,
+}
+
+fn slug(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_.".contains(&byte)
+        })
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Event {
     pub schema_version: u32,
     pub id: Uuid,
     pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend: Option<Frontend>,
     pub kind: String,
     pub device_name: String,
     pub occurred_at_ms: i64,
@@ -28,10 +44,14 @@ impl Event {
         self.schema_version == 1
             && !self.id.is_nil()
             && self.occurred_at_ms >= 0
-            && matches!(
-                (self.tool.as_str(), self.kind.as_str()),
-                ("codex" | "claude-code", "turn.completed") | ("manual", "test")
-            )
+            && ((self.kind == "test" && self.tool == "manual")
+                || (self.kind == "turn.completed" && self.tool != "manual" && slug(&self.tool)))
+            && self.frontend.as_ref().is_none_or(|source| {
+                slug(&source.id)
+                    && !source.label.trim().is_empty()
+                    && source.label.len() <= 128
+                    && !source.label.chars().any(char::is_control)
+            })
             && !self.device_name.trim().is_empty()
             && self.device_name.len() <= 256
             && [&self.project, &self.session_id, &self.turn_id]
@@ -59,6 +79,8 @@ pub struct EventSummary {
     pub device_id: String,
     pub device_name: String,
     pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontend: Option<Frontend>,
     pub kind: String,
     pub project: Option<String>,
     pub occurred_at_ms: i64,
@@ -76,6 +98,7 @@ impl StoredEvent {
             device_id: self.device_id.clone(),
             device_name: self.event.device_name.clone(),
             tool: self.event.tool.clone(),
+            frontend: self.event.frontend.clone(),
             kind: self.event.kind.clone(),
             project: self.event.project.clone(),
             occurred_at_ms: self.event.occurred_at_ms,
@@ -94,7 +117,7 @@ impl StoredEvent {
     }
 }
 
-pub struct Store(Connection);
+pub struct Store(pub(crate) Connection);
 
 pub enum Insert {
     New(i64),
@@ -115,6 +138,7 @@ impl Store {
                 event_json TEXT NOT NULL
             );",
         )?;
+        crate::mailbox::migrate(&db)?;
         Ok(Self(db))
     }
 
@@ -192,6 +216,7 @@ mod tests {
             schema_version: 1,
             id: "ab97b1cf-23ea-4792-ab5a-aefa519609e3".parse().unwrap(),
             tool: "codex".into(),
+            frontend: None,
             kind: "turn.completed".into(),
             device_name: "Windows".into(),
             occurred_at_ms: 42,
