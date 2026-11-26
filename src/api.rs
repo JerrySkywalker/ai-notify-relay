@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
 };
+use tokio::sync::mpsc;
 
 use axum::{
     Json, Router,
@@ -23,16 +24,35 @@ use crate::store::{Event, EventSummary, Insert, Store};
 pub struct State(Arc<Service>);
 
 struct Service {
-    store: Mutex<Store>,
+    store: Arc<Mutex<Store>>,
     auth: Auth,
+    fcm_notifier: Option<mpsc::Sender<()>>,
 }
 
 impl State {
     pub fn new(store: Store, auth: Auth) -> Self {
         Self(Arc::new(Service {
-            store: Mutex::new(store),
+            store: Arc::new(Mutex::new(store)),
             auth,
+            fcm_notifier: None,
         }))
+    }
+
+    pub fn with_fcm_notifier(mut self, tx: mpsc::Sender<()>) -> Self {
+        if let Some(s) = Arc::get_mut(&mut self.0) {
+            s.fcm_notifier = Some(tx);
+        } else {
+            self.0 = Arc::new(Service {
+                store: self.0.store.clone(),
+                auth: self.0.auth.clone(),
+                fcm_notifier: Some(tx),
+            });
+        }
+        self
+    }
+
+    pub fn store_arc(&self) -> Arc<Mutex<Store>> {
+        self.0.store.clone()
     }
 
     fn store(&self) -> Result<MutexGuard<'_, Store>, ApiError> {
@@ -40,10 +60,18 @@ impl State {
     }
 }
 
+#[derive(Clone)]
 pub struct Auth {
-    reader: [u8; 32],
-    inbox: Option<[u8; 32]>,
-    writers: HashMap<String, [u8; 32]>,
+    readers: Vec<[u8; 32]>,
+    inboxes: Vec<[u8; 32]>,
+    writers: HashMap<String, Vec<[u8; 32]>>,
+}
+
+fn split_tokens(raw: &str) -> Vec<&str> {
+    raw.split([',', ';'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 impl Auth {
@@ -52,34 +80,65 @@ impl Auth {
         writers: HashMap<String, String>,
         inbox: Option<&str>,
     ) -> Result<Self, &'static str> {
-        if !valid_token(reader) || writers.is_empty() {
+        let reader_tokens = split_tokens(reader);
+        if reader_tokens.is_empty()
+            || reader_tokens.iter().any(|t| !valid_token(t))
+            || writers.is_empty()
+        {
             return Err("configure a reader token and at least one writer");
         }
-        let reader = hash(reader);
-        let mut used = HashSet::from([reader]);
-        if inbox.is_some_and(|token| !valid_token(token) || !used.insert(hash(token))) {
-            return Err("configure a valid inbox token distinct from all other tokens");
+        let mut used = HashSet::new();
+        let mut readers = Vec::new();
+        for t in reader_tokens {
+            let h = hash(t);
+            if !used.insert(h) {
+                return Err("each token must be unique");
+            }
+            readers.push(h);
         }
+
+        let mut inboxes = Vec::new();
+        if let Some(inbox_str) = inbox {
+            let tokens = split_tokens(inbox_str);
+            if tokens.is_empty() || tokens.iter().any(|t| !valid_token(t)) {
+                return Err("configure a valid inbox token distinct from all other tokens");
+            }
+            for t in tokens {
+                let h = hash(t);
+                if !used.insert(h) {
+                    return Err("configure a valid inbox token distinct from all other tokens");
+                }
+                inboxes.push(h);
+            }
+        }
+
         let mut devices = HashMap::new();
-        for (device, token) in writers {
+        for (device, token_str) in writers {
             if device.is_empty()
                 || device.len() > 64
                 || !device
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-                || !valid_token(&token)
             {
                 return Err("invalid device ID or writer token");
             }
-            let token = hash(&token);
-            if !used.insert(token) {
-                return Err("each device and reader must have a distinct token");
+            let tokens = split_tokens(&token_str);
+            if tokens.is_empty() || tokens.iter().any(|t| !valid_token(t)) {
+                return Err("invalid device ID or writer token");
             }
-            devices.insert(device, token);
+            let mut device_tokens = Vec::new();
+            for t in tokens {
+                let h = hash(t);
+                if !used.insert(h) {
+                    return Err("each device and reader must have a distinct token");
+                }
+                device_tokens.push(h);
+            }
+            devices.insert(device, device_tokens);
         }
         Ok(Self {
-            reader,
-            inbox: inbox.map(hash),
+            readers,
+            inboxes,
             writers: devices,
         })
     }
@@ -87,22 +146,32 @@ impl Auth {
     fn reader(&self, headers: &HeaderMap) -> Result<bool, ApiError> {
         let presented = bearer(headers)?;
         if self
-            .inbox
-            .as_ref()
-            .is_some_and(|token| bool::from(token.ct_eq(&presented)))
+            .inboxes
+            .iter()
+            .any(|token| bool::from(token.ct_eq(&presented)))
         {
             Ok(true)
-        } else if bool::from(self.reader.ct_eq(&presented)) {
+        } else if self
+            .readers
+            .iter()
+            .any(|token| bool::from(token.ct_eq(&presented)))
+        {
             Ok(false)
         } else {
             Err(ApiError::unauthorized())
         }
     }
+
     fn writer(&self, headers: &HeaderMap) -> Result<&str, ApiError> {
         let presented = bearer(headers)?;
         self.writers
             .iter()
-            .find_map(|(id, stored)| bool::from(stored.ct_eq(&presented)).then_some(id.as_str()))
+            .find_map(|(id, stored_tokens)| {
+                stored_tokens
+                    .iter()
+                    .any(|stored| bool::from(stored.ct_eq(&presented)))
+                    .then_some(id.as_str())
+            })
             .ok_or_else(ApiError::unauthorized)
     }
 }
@@ -133,6 +202,10 @@ pub fn router(state: State) -> Router {
         .route("/v1/events/{id}", get(event_detail))
         .route("/v1/inbox/changes", get(inbox_changes))
         .route("/v1/inbox/actions", post(inbox_action))
+        .route("/v1/devices/register", post(register_device))
+        .route("/v1/devices/unregister", post(unregister_device))
+        .route("/v1/devices", get(list_devices))
+        .route("/v1/push/deliveries", get(push_deliveries))
         .layer(DefaultBodyLimit::max(820 * 1024))
         .with_state(state)
 }
@@ -159,7 +232,12 @@ async fn create_event(
         .insert(device, &event)
         .map_err(ApiError::database)?;
     let (status, seq) = match result {
-        Insert::New(seq) => (StatusCode::CREATED, seq),
+        Insert::New(seq) => {
+            if let Some(ref tx) = state.0.fcm_notifier {
+                let _ = tx.try_send(());
+            }
+            (StatusCode::CREATED, seq)
+        }
         Insert::Existing(seq) => (StatusCode::OK, seq),
         Insert::Conflict => return Err(ApiError(StatusCode::CONFLICT, "event ID already in use")),
     };
@@ -171,12 +249,28 @@ struct Page {
     #[serde(default)]
     after: i64,
     limit: Option<i64>,
+    stream_id: Option<String>,
+    cursor_event_id: Option<Uuid>,
+}
+
+impl Page {
+    fn reset_event_cursor(&self, store: &Store) -> rusqlite::Result<bool> {
+        if let Some(stream_id) = &self.stream_id {
+            return Ok(stream_id != store.stream_id());
+        }
+        match self.cursor_event_id {
+            Some(id) if self.after > 0 => Ok(!store.cursor_matches(self.after, id)?),
+            _ => Ok(false),
+        }
+    }
 }
 
 #[derive(Serialize)]
 struct Feed {
     events: Vec<EventSummary>,
     next_cursor: i64,
+    stream_id: String,
+    reset_cursor: bool,
 }
 
 async fn events(
@@ -189,14 +283,20 @@ async fn events(
     if page.after < 0 || !(1..=100).contains(&limit) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid cursor or limit"));
     }
-    let entries = state
-        .store()?
-        .events(page.after, limit)
+    let store = state.store()?;
+    let reset_cursor = page
+        .reset_event_cursor(&store)
         .map_err(ApiError::database)?;
-    let next_cursor = entries.last().map_or(page.after, |entry| entry.seq);
+    let after = if reset_cursor { 0 } else { page.after };
+    let entries = store.events(after, limit).map_err(ApiError::database)?;
+    let stream_id = store.stream_id().to_owned();
+    drop(store);
+    let next_cursor = entries.last().map_or(after, |entry| entry.seq);
     Ok(Json(Feed {
         events: entries.iter().map(|entry| entry.summary()).collect(),
         next_cursor,
+        stream_id,
+        reset_cursor,
     }))
 }
 
@@ -244,7 +344,7 @@ async fn inbox_changes(
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid cursor or limit"));
     }
     let changes =
-        mailbox::changes(&state.store()?.0, page.after, limit).map_err(ApiError::database)?;
+        mailbox::changes(&state.store()?.db, page.after, limit).map_err(ApiError::database)?;
     let next_cursor = changes.last().map_or(page.after, |entry| entry.seq);
     Ok(Json(Changes {
         changes,
@@ -270,13 +370,95 @@ async fn inbox_action(
             "invalid inbox action",
         ));
     }
-    match mailbox::apply(&mut state.store()?.0, &action).map_err(ApiError::database)? {
+    match mailbox::apply(&mut state.store()?.db, &action).map_err(ApiError::database)? {
         Applied::State(state) => Ok(Json(state)),
         Applied::Missing => Err(ApiError(StatusCode::NOT_FOUND, "event not found")),
         Applied::Conflict => Err(ApiError(StatusCode::CONFLICT, "action ID already in use")),
     }
 }
 
+#[derive(Deserialize)]
+struct RegisterDevice {
+    token: String,
+    #[serde(default = "default_device_type")]
+    device_type: String,
+    #[serde(default = "default_app_id")]
+    app_id: String,
+}
+
+fn default_device_type() -> String {
+    "android".into()
+}
+
+fn default_app_id() -> String {
+    "io.github.jerryskywalker.ainotify".into()
+}
+
+#[derive(Deserialize)]
+struct UnregisterDevice {
+    token: String,
+}
+
+async fn register_device(
+    AxumState(state): AxumState<State>,
+    headers: HeaderMap,
+    Json(body): Json<RegisterDevice>,
+) -> Result<impl IntoResponse, ApiError> {
+    let is_inbox = state.0.auth.reader(&headers)?;
+    let device_id = if is_inbox { "inbox" } else { "reader" };
+    if body.token.trim().is_empty() || body.token.len() > 4096 {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid push token"));
+    }
+    state
+        .store()?
+        .register_device(
+            device_id,
+            body.token.trim(),
+            &body.device_type,
+            &body.app_id,
+        )
+        .map_err(ApiError::database)?;
+    Ok((StatusCode::OK, Json(json!({"ok": true}))))
+}
+
+async fn unregister_device(
+    AxumState(state): AxumState<State>,
+    headers: HeaderMap,
+    Json(body): Json<UnregisterDevice>,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = state.0.auth.reader(&headers)?;
+    let removed = state
+        .store()?
+        .unregister_device(body.token.trim())
+        .map_err(ApiError::database)?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({"ok": true, "removed": removed})),
+    ))
+}
+
+async fn list_devices(
+    AxumState(state): AxumState<State>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = state.0.auth.reader(&headers)?;
+    let devices = state.store()?.push_devices().map_err(ApiError::database)?;
+    Ok(Json(json!({"devices": devices})))
+}
+
+async fn push_deliveries(
+    AxumState(state): AxumState<State>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = state.0.auth.reader(&headers)?;
+    let deliveries = state
+        .store()?
+        .push_deliveries(50)
+        .map_err(ApiError::database)?;
+    Ok(Json(json!({"deliveries": deliveries})))
+}
+
+#[derive(Debug)]
 struct ApiError(StatusCode, &'static str);
 
 impl ApiError {
@@ -297,5 +479,94 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(json!({"error": self.1}))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_cursor_resets_for_replaced_stream_and_missing_legacy_anchor() {
+        let store = Store::open(":memory:").unwrap();
+        let mut page = Page {
+            after: 5,
+            limit: None,
+            stream_id: Some(store.stream_id().to_owned()),
+            cursor_event_id: None,
+        };
+        assert!(!page.reset_event_cursor(&store).unwrap());
+        page.stream_id = Some("another-stream".into());
+        assert!(page.reset_event_cursor(&store).unwrap());
+        page.stream_id = None;
+        assert!(!page.reset_event_cursor(&store).unwrap());
+        page.cursor_event_id = Some(Uuid::from_u128(1));
+        assert!(page.reset_event_cursor(&store).unwrap());
+    }
+
+    #[test]
+    fn credential_rotation_allows_parallel_transition_and_revocation() {
+        let r1 = "reader-token-version-one-1234567";
+        let r2 = "reader-token-version-two-1234567";
+        let i1 = "inbox--token-version-one-1234567";
+        let i2 = "inbox--token-version-two-1234567";
+        let w1 = "writer-token-version-one-1234567";
+        let w2 = "writer-token-version-two-1234567";
+
+        // During rotation: both v1 and v2 accepted
+        let mut writers = HashMap::new();
+        writers.insert("device-1".into(), format!("{w1}, {w2}"));
+        let auth = Auth::new(
+            &format!("{r1}, {r2}"),
+            writers,
+            Some(&format!("{i1}, {i2}")),
+        )
+        .unwrap();
+
+        let header_for = |token: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            h
+        };
+
+        // Readers: both accepted
+        assert_eq!(auth.reader(&header_for(r1)).unwrap(), false);
+        assert_eq!(auth.reader(&header_for(r2)).unwrap(), false);
+
+        // Inboxes: both accepted as inbox (true)
+        assert_eq!(auth.reader(&header_for(i1)).unwrap(), true);
+        assert_eq!(auth.reader(&header_for(i2)).unwrap(), true);
+
+        // Writers: both accepted
+        assert_eq!(auth.writer(&header_for(w1)).unwrap(), "device-1");
+        assert_eq!(auth.writer(&header_for(w2)).unwrap(), "device-1");
+
+        // Invalid token rejected
+        assert!(
+            auth.reader(&header_for("invalid-token-string-1234567"))
+                .is_err()
+        );
+        assert!(
+            auth.writer(&header_for("invalid-token-string-1234567"))
+                .is_err()
+        );
+
+        // After rotation: v1 revoked, only v2 accepted
+        let mut final_writers = HashMap::new();
+        final_writers.insert("device-1".into(), w2.into());
+        let final_auth = Auth::new(r2, final_writers, Some(i2)).unwrap();
+
+        // v1 now unauthorized
+        assert!(final_auth.reader(&header_for(r1)).is_err());
+        assert!(final_auth.reader(&header_for(i1)).is_err());
+        assert!(final_auth.writer(&header_for(w1)).is_err());
+
+        // v2 still authorized
+        assert_eq!(final_auth.reader(&header_for(r2)).unwrap(), false);
+        assert_eq!(final_auth.reader(&header_for(i2)).unwrap(), true);
+        assert_eq!(final_auth.writer(&header_for(w2)).unwrap(), "device-1");
     }
 }
